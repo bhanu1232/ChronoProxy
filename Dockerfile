@@ -79,9 +79,9 @@ COPY --from=builder /app/dist ./dist
 COPY dashboard/ ./dashboard/
 
 # ── Security: non-root user ───────────────────────────────────────────────────
-RUN groupadd -r proxy && useradd -r -g proxy -G audio,video proxy \
-    && chown -R proxy:proxy /app /ms-playwright
-USER proxy
+RUN groupadd -r chronoproxy && useradd -r -g chronoproxy -G audio,video chronoproxy \
+    && chown -R chronoproxy:chronoproxy /app /ms-playwright
+USER chronoproxy
 
 # ── Hard RAM cap via Node options ─────────────────────────────────────────────
 ENV NODE_OPTIONS="--max-old-space-size=400"
