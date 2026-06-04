@@ -72,6 +72,8 @@ RUN npx playwright install chromium --with-deps
 
 # Copy compiled JS from builder
 COPY --from=builder /app/dist ./dist
+# Copy dashboard UI
+COPY dashboard/ ./dashboard/
 
 # ── Security: non-root user ───────────────────────────────────────────────────
 RUN groupadd -r proxy && useradd -r -g proxy -G audio,video proxy \
