@@ -1,0 +1,28 @@
+# Nixpacks Configuration for Playwright Fallback
+# Used if Railway project build provider is locked to Nixpacks.
+
+[phases.setup]
+# Install required system libraries for Chromium font rendering and execution
+nixPkgs = [
+  "chromium",
+  "libnss3",
+  "fontconfig",
+  "freetype",
+  "libgbm",
+  "libxkbcommon",
+  "libatk-bridge2-0",
+  "libcups",
+  "pango",
+  "atk",
+  "cairo",
+  "gdk-pixbuf",
+  "gtk3",
+  "glib"
+]
+
+[phases.build]
+# Install node packages and force install playwright chromium browser binaries
+cmds = [
+  "npm install",
+  "npx playwright install chromium"
+]
