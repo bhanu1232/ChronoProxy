@@ -7,6 +7,7 @@
  * before Blink even begins to decode them — eliminating wasted allocation.
  */
 
+import { execSync } from 'child_process';
 import { chromium, Browser, BrowserContext } from 'playwright';
 
 /**
@@ -38,7 +39,7 @@ export interface BrowserBundle {
  * never need to think about asset interception themselves.
  */
 export async function launchLeanBrowser(): Promise<BrowserBundle> {
-  const browser = await chromium.launch({
+  const launchOptions = {
     headless: true,
     args: [
       // ── GPU & Rendering ─────────────────────────────────────────────────
@@ -79,7 +80,37 @@ export async function launchLeanBrowser(): Promise<BrowserBundle> {
       // ── V8 Memory Limits ─────────────────────────────────────────────────
       '--js-flags=--max-old-space-size=64', // Cap JS heap per Chromium child
     ],
-  });
+  };
+
+  let browser: Browser;
+  try {
+    browser = await chromium.launch(launchOptions);
+  } catch (err: any) {
+    if (
+      err.message &&
+      (err.message.includes("Executable doesn't exist") ||
+        err.message.includes("playwright install") ||
+        err.message.includes("Looks like Playwright was just installed"))
+    ) {
+      console.warn('[browser] Chromium executable not found. Running self-healing playwright installation...');
+      try {
+        execSync('npx playwright install chromium', {
+          stdio: 'inherit',
+          env: {
+            ...process.env,
+            PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright',
+          },
+        });
+        console.info('[browser] Self-healing playwright installation complete. Retrying launch...');
+        browser = await chromium.launch(launchOptions);
+      } catch (installErr: any) {
+        console.error('[browser] Self-healing installation failed:', installErr);
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
 
   // Isolated browser context: no cookies, no cache, no persistent storage.
   const context = await browser.newContext({
