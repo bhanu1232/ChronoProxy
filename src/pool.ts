@@ -50,6 +50,7 @@ export class BrowserPool extends EventEmitter {
 
   constructor(options?: { maxBrowsers?: number; acquireTimeoutMs?: number }) {
     super();
+    this.setMaxListeners(100);
     this.maxBrowsers      = options?.maxBrowsers      ?? parseInt(process.env['MAX_BROWSERS'] ?? '4', 10);
     this.acquireTimeoutMs = options?.acquireTimeoutMs ?? parseInt(process.env['BROWSER_TIMEOUT_MS'] ?? '15000', 10);
   }

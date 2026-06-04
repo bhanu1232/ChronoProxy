@@ -62,13 +62,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 # Copy production dependencies and compiled output
 COPY package*.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
+# ── Playwright Environment ────────────────────────────────────────────────────
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 # Install Playwright browsers (Chromium only)
-RUN npx playwright install chromium --with-deps
+RUN mkdir -p /ms-playwright && \
+    npx playwright install chromium --with-deps
 
 # Copy compiled JS from builder
 COPY --from=builder /app/dist ./dist
@@ -77,7 +80,7 @@ COPY dashboard/ ./dashboard/
 
 # ── Security: non-root user ───────────────────────────────────────────────────
 RUN groupadd -r proxy && useradd -r -g proxy -G audio,video proxy \
-    && chown -R proxy:proxy /app
+    && chown -R proxy:proxy /app /ms-playwright
 USER proxy
 
 # ── Hard RAM cap via Node options ─────────────────────────────────────────────
