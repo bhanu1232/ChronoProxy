@@ -1,52 +1,73 @@
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Semantic Browser Proxy — Multi-stage Dockerfile                    ║
-# ║  Base: mcr.microsoft.com/playwright:v1.44.1-jammy (Ubuntu 22.04)   ║
-# ║  Playwright + all Chromium system deps pre-installed in base image  ║
-# ╚══════════════════════════════════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ChronoProxy — Production Dockerfile
+#  Base  : node:20-slim (Debian Bookworm, ~250 MB)
+#  Final : ~600 MB (Node + Chromium headless shell + system libs)
+#
+#  Build : docker build -t chronoproxy .
+#  Run   : docker run -p 8080:8080 -e PORT=8080 chronoproxy
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 · Builder — compile TypeScript → dist/
+# ─────────────────────────────────────────────────────────────────────────────
 FROM node:20-slim AS builder
 
 WORKDIR /app
 
+# Install deps (all, including devDeps for tsc)
 COPY package*.json tsconfig.json ./
 RUN npm ci --ignore-scripts
 
+# Compile TypeScript
 COPY src/ ./src/
 RUN npm run build
 
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# The official Playwright image ships with Chromium + ALL system dependencies.
-# Running as root is fine here because we use --no-sandbox in browser.ts.
-FROM mcr.microsoft.com/playwright:v1.44.1-jammy AS runtime
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 · Runtime — lean production image
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-slim AS runtime
+
+# ── System dependencies required by Chromium headless shell ──────────────────
+# `--with-deps` in the playwright install step handles this automatically,
+# but we pre-seed curl and ca-certs so the install can reach the internet.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install production node dependencies only
+# ── Node production dependencies ──────────────────────────────────────────────
 COPY package*.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
-# Browsers are pre-installed in /ms-playwright inside the base image
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# ── Playwright: install Chromium headless shell + all its system deps ─────────
+# PLAYWRIGHT_BROWSERS_PATH tells Playwright where to store & find the browser.
+# --with-deps automatically installs every required apt package on this OS.
+# chromium installs the smaller headless-shell binary (not the full browser).
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
+RUN npx playwright install --with-deps chromium
 
-# Copy compiled app and dashboard from builder stage
+# ── Application code ──────────────────────────────────────────────────────────
 COPY --from=builder /app/dist ./dist
 COPY dashboard/ ./dashboard/
 
 # ── Runtime environment ───────────────────────────────────────────────────────
-ENV NODE_OPTIONS="--max-old-space-size=400"
-ENV NODE_ENV="production"
-# PORT and HOST are set here as defaults; Render overrides PORT at runtime
+ENV NODE_ENV=production
+# Cap Node.js heap — leaves room for Chromium processes within 512 MB
+ENV NODE_OPTIONS="--max-old-space-size=350"
+# PORT / HOST — overridden at runtime by Render / Railway / Docker
 ENV PORT=8080
 ENV HOST=0.0.0.0
+# Browser pool: 2 instances × ~95 MB = ~190 MB + ~120 MB Node = ~310 MB total
+ENV MAX_BROWSERS=2
+ENV BROWSER_TIMEOUT_MS=30000
 
 EXPOSE 8080
 
-STOPSIGNAL SIGTERM
-
-# Health check — wget is available in the playwright base image
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
-  CMD wget -qO- http://localhost:${PORT}/v1/health || exit 1
+# ── Health check ──────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD curl -fs http://localhost:${PORT}/v1/health || exit 1
 
 CMD ["node", "dist/server.js"]

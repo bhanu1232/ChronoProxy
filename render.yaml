@@ -1,62 +1,56 @@
-# render.yaml — Render Infrastructure-as-Code
-# Docs: https://render.com/docs/blueprint-spec
+# ═══════════════════════════════════════════════════════════════════════════════
+#  render.yaml — ChronoProxy Render Blueprint
+#  Docs: https://render.com/docs/blueprint-spec
 #
-# Deploy steps:
-#   1. Push this file to GitHub (already done).
-#   2. Go to https://dashboard.render.com → New → Blueprint.
-#   3. Connect GitHub repo: bhanu1232/ChronoProxy
-#   4. Render reads this file and creates the service automatically.
-#   5. Add ENCRYPTION_KEY in the Environment tab before first request.
+#  One-click deploy:
+#    1. Push repo to GitHub (already done: bhanu1232/ChronoProxy)
+#    2. Render Dashboard → New → Blueprint → connect repo
+#    3. Set secret env vars in the Environment tab (see bottom of this file)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 services:
   - type: web
     name: chronoproxy
     runtime: docker
     dockerfilePath: ./Dockerfile
+    plan: free                    # 512 MB RAM · 0.1 CPU · spins down after 15 min idle
 
-    # free plan = 512MB RAM, spins down after 15 min idle.
-    # Upgrade to "starter" ($7/mo) for always-on.
-    plan: free
-
-    # Health check path — Render polls this to confirm the app is ready.
-    # The Playwright image is large (~1.5GB); give it 3 minutes to start.
+    # Render polls this path to decide when the container is healthy.
+    # The first deploy pulls Chromium (~300 MB) so allow generous startup time.
     healthCheckPath: /v1/health
 
     envVars:
-      # ── Server ──────────────────────────────────────────────────────────
-      - key: PORT
-        value: "10000"
+      # Render injects $PORT automatically — the app reads it from process.env.PORT
+      # DO NOT hardcode PORT here; let Render control it.
+
       - key: HOST
         value: "0.0.0.0"
       - key: NODE_ENV
         value: production
       - key: NODE_OPTIONS
-        value: "--max-old-space-size=400"
+        value: "--max-old-space-size=350"
 
-      # ── Browser Pool ─────────────────────────────────────────────────────
-      # Free plan: 512MB RAM. 2 browsers × 95MB = 190MB + 120MB Node = safe.
+      # 2 browsers max on free tier (2 × 95 MB + 120 MB Node ≈ 310 MB)
       - key: MAX_BROWSERS
         value: "2"
       - key: BROWSER_TIMEOUT_MS
         value: "30000"
 
-      # ── Rate Limiting ─────────────────────────────────────────────────────
       - key: RATE_LIMIT_MAX
         value: "30"
       - key: RATE_LIMIT_WINDOW_MS
         value: "60000"
 
-      # ── Playwright ────────────────────────────────────────────────────────
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /ms-playwright
+        value: /app/.playwright-browsers
 
-      # ── Secrets: add these manually in the Render dashboard ──────────────
-      # ENCRYPTION_KEY  → 64-char hex string for AES-256-GCM vault
-      # REDIS_HOST      → if you add a Redis service
-      # REDIS_PORT
+      # ── Secrets: add these in the Render dashboard → Environment tab ─────────
+      # ENCRYPTION_KEY   64-char hex string (AES-256-GCM vault key)
+      # REDIS_HOST       Redis host (add a Render Redis service if needed)
+      # REDIS_PORT       default 6379
       # REDIS_PASSWORD
-      # PG_HOST         → if you add a Postgres service
-      # PG_PORT
+      # PG_HOST          Postgres host (add a Render Postgres service if needed)
+      # PG_PORT          default 5432
       # PG_DATABASE
       # PG_USER
       # PG_PASSWORD
