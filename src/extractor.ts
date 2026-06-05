@@ -57,8 +57,8 @@ export async function extractPageState(page: Page): Promise<PageState> {
       const tid = (el as HTMLElement).dataset.testid;
       if (tid) return `[data-testid="${tid}"]`;
 
-      // 3. name attribute (forms)
-      const name = (el as HTMLInputElement).name;
+      // 3. name attribute (forms) — works for both input and textarea
+      const name = (el as HTMLInputElement | HTMLTextAreaElement).name;
       if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
 
       // 4. aria-label (accessibility)
@@ -133,7 +133,8 @@ export async function extractPageState(page: Page): Promise<PageState> {
     })).filter(b => b.text);
 
     // ── Inputs ─────────────────────────────────────────────────────────────
-    const SKIP = new Set(['hidden', 'button', 'submit', 'reset', 'image']);
+    // Skip file, hidden, and button-type inputs — not useful for AI agents.
+    const SKIP = new Set(['hidden', 'button', 'submit', 'reset', 'image', 'file']);
     const inputs: InputField[] = Array.from(document.querySelectorAll('input, textarea'))
       .filter(i => !SKIP.has((i as HTMLInputElement).type))
       .map(i => ({

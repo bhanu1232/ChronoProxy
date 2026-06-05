@@ -68,36 +68,35 @@ if (ext.ok) {
 }
 
 // ── 3. Create session ──────────────────────────────────────────────────────────
-section('[3/7] POST /v1/session → open google.com');
-info('creating persistent AI agent session...');
+section('[3/7] POST /v1/session → the-internet.herokuapp.com/login');
+info('creating persistent AI agent session on a real login form...');
 const t3 = Date.now();
-const created = await req('POST', '/v1/session', { url: 'https://google.com' });
+const created = await req('POST', '/v1/session', { url: 'https://the-internet.herokuapp.com/login' });
 let sessionId = null;
 
 if (created.status === 201) {
   sessionId = created.data.sessionId;
   pass(`session created: ${sessionId}  (${Date.now()-t3}ms)`);
   pass(`page URL: ${created.data.state?.url}`);
-  const inp = created.data.state?.inputs?.[0];
-  if (inp) info(`found input selector: ${inp.selector}`);
+  pass(`page title: "${created.data.state?.title}"`);
+  const inputs = created.data.state?.inputs ?? [];
+  inputs.forEach(i => info(`  input: name="${i.name}" type="${i.type}" selector="${i.selector}"`));
 } else {
   fail(`Session create failed: ${JSON.stringify(created.data)}`);
 }
 
-// ── 4. Perform actions — search for "playwright" ───────────────────────────────
+// ── 4. Fill login form + submit ────────────────────────────────────────────────
 if (sessionId) {
-  section('[4/7] POST /v1/session/:id/action — type + search');
-  info('sending actions: fill search box → press Enter → wait for results...');
+  section('[4/7] POST /v1/session/:id/action — fill login form + submit');
+  info('actions: fill username → fill password → click Login → wait for result...');
   const t4 = Date.now();
-
-  // Get the search input selector from the page state
-  const searchSelector = created.data.state?.inputs?.[0]?.selector ?? 'textarea[name="q"]';
 
   const actionRes = await req('POST', `/v1/session/${sessionId}/action`, {
     actions: [
-      { type: 'fill',     selector: searchSelector, value: 'playwright browser automation' },
-      { type: 'press',    key: 'Enter' },
-      { type: 'wait_for', selector: 'h3', timeout: 8000 },
+      { type: 'fill',     selector: '#username',          value: 'tomsmith' },
+      { type: 'fill',     selector: '#password',          value: 'SuperSecretPassword!' },
+      { type: 'click',    selector: 'button[type="submit"]' },
+      { type: 'wait_for', selector: '#flash',             timeout: 8000 },
     ],
   });
 
@@ -107,33 +106,45 @@ if (sessionId) {
     if (allOk) pass(`all ${results.length} actions succeeded  (${Date.now()-t4}ms)`);
     else fail(`action failed: ${JSON.stringify(results.find(r => !r.ok))}`);
     results.forEach(r => info(`  ${r.type}: ${r.durationMs}ms ${r.ok ? '✓' : '✗ ' + r.error}`));
-    pass(`now on: ${actionRes.data.state?.url}`);
-    const firstH3 = actionRes.data.state?.headings?.find(h => h.level === 'h3');
-    if (firstH3) pass(`first result heading: "${firstH3.text}"`);
+    pass(`landed on: ${actionRes.data.state?.url}`);
+
+    // Verify the flash message contains login success
+    const flashText = actionRes.data.state?.text ?? '';
+    if (flashText.toLowerCase().includes('secure')) {
+      pass(`login SUCCESS confirmed in page text ✔`);
+    } else if (flashText.toLowerCase().includes('invalid')) {
+      fail(`login failed — got: "${flashText.slice(0, 80)}"`);
+    } else {
+      info(`page text snippet: "${flashText.slice(0, 120)}"`);
+    }
+
+    // Show what the results page looks like to an AI agent
+    const state = actionRes.data.state;
+    info(`headings on results page: ${state?.headings?.map(h => h.text).join(' | ')}`);
+    info(`links available: ${state?.links?.slice(0,3).map(l => l.text).join(', ')}`);
   } else {
-    fail(`Action failed: ${JSON.stringify(actionRes.data)}`);
+    fail(`Action request failed: ${JSON.stringify(actionRes.data)}`);
   }
 
-  // ── 5. Read current page state ─────────────────────────────────────────────
-  section('[5/7] GET /v1/session/:id — read results page');
+  // ── 5. Read current page state ───────────────────────────────────────────────
+  section('[5/7] GET /v1/session/:id — read secure page state');
   const t5 = Date.now();
   const snap = await req('GET', `/v1/session/${sessionId}`);
   if (snap.ok) {
     pass(`HTTP 200  (${Date.now()-t5}ms)`);
-    pass(`${snap.data.state?.links?.length} links on results page`);
+    pass(`${snap.data.state?.links?.length} links on page`);
     pass(`${snap.data.state?.headings?.length} headings`);
-    info(`text snippet: "${snap.data.state?.text?.slice(0, 200)}..."`);
+    info(`URL: ${snap.data.state?.url}`);
   } else {
     fail(`Get session failed: ${JSON.stringify(snap.data)}`);
   }
 
-  // ── 6. Delete session ──────────────────────────────────────────────────────
+  // ── 6. Delete session ─────────────────────────────────────────────────────────
   section('[6/7] DELETE /v1/session/:id — close session');
   const del = await req('DELETE', `/v1/session/${sessionId}`);
   if (del.ok && del.data.ok) pass(`session ${sessionId} destroyed`);
   else fail(`Delete failed: ${JSON.stringify(del.data)}`);
 
-  // Verify it's gone
   const gone = await req('GET', `/v1/session/${sessionId}`);
   if (gone.status === 404) pass('session correctly returns 404 after deletion');
   else fail(`Expected 404, got ${gone.status}`);
