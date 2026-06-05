@@ -2,29 +2,30 @@
 # Docs: https://render.com/docs/blueprint-spec
 #
 # Deploy steps:
-#   1. Push this file (and your code) to GitHub.
+#   1. Push this file to GitHub (already done).
 #   2. Go to https://dashboard.render.com → New → Blueprint.
-#   3. Connect your GitHub repo (bhanu1232/ChronoProxy).
-#   4. Render reads this file and sets up the service automatically.
-#   5. Set the ENCRYPTION_KEY environment variable in the Render dashboard
-#      (Environment tab of the service) before first deploy.
+#   3. Connect GitHub repo: bhanu1232/ChronoProxy
+#   4. Render reads this file and creates the service automatically.
+#   5. Add ENCRYPTION_KEY in the Environment tab before first request.
 
 services:
   - type: web
     name: chronoproxy
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # Render free tier: 512MB RAM — matches our pool ceiling perfectly.
-    # Upgrade to "starter" ($7/mo) for always-on (no spin-down).
+
+    # free plan = 512MB RAM, spins down after 15 min idle.
+    # Upgrade to "starter" ($7/mo) for always-on.
     plan: free
 
-    # Health check — Render uses this to know when the container is ready.
+    # Health check path — Render polls this to confirm the app is ready.
+    # The Playwright image is large (~1.5GB); give it 3 minutes to start.
     healthCheckPath: /v1/health
 
     envVars:
       # ── Server ──────────────────────────────────────────────────────────
       - key: PORT
-        value: "8080"
+        value: "10000"
       - key: HOST
         value: "0.0.0.0"
       - key: NODE_ENV
@@ -33,7 +34,7 @@ services:
         value: "--max-old-space-size=400"
 
       # ── Browser Pool ─────────────────────────────────────────────────────
-      # Free tier has 512MB RAM. 2 browsers × ~95MB = 190MB + 120MB Node = 310MB safe.
+      # Free plan: 512MB RAM. 2 browsers × 95MB = 190MB + 120MB Node = safe.
       - key: MAX_BROWSERS
         value: "2"
       - key: BROWSER_TIMEOUT_MS
@@ -49,13 +50,13 @@ services:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /ms-playwright
 
-      # ── Secrets: set these manually in the Render dashboard ──────────────
-      # - key: ENCRYPTION_KEY     ← 64-char hex string for AES-256-GCM vault
-      # - key: REDIS_HOST         ← If you add a Redis service
-      # - key: REDIS_PORT
-      # - key: REDIS_PASSWORD
-      # - key: PG_HOST            ← If you add a Postgres service
-      # - key: PG_PORT
-      # - key: PG_DATABASE
-      # - key: PG_USER
-      # - key: PG_PASSWORD
+      # ── Secrets: add these manually in the Render dashboard ──────────────
+      # ENCRYPTION_KEY  → 64-char hex string for AES-256-GCM vault
+      # REDIS_HOST      → if you add a Redis service
+      # REDIS_PORT
+      # REDIS_PASSWORD
+      # PG_HOST         → if you add a Postgres service
+      # PG_PORT
+      # PG_DATABASE
+      # PG_USER
+      # PG_PASSWORD

@@ -4,7 +4,6 @@
 # ║  Playwright + all Chromium system deps pre-installed in base image  ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
-# ── Stage 1: Builder ──────────────────────────────────────────────────────────
 FROM node:20-slim AS builder
 
 WORKDIR /app
@@ -16,8 +15,6 @@ COPY src/ ./src/
 RUN npm run build
 
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# Use the official Playwright image — Chromium + all system deps are pre-baked.
 FROM mcr.microsoft.com/playwright:v1.44.1-jammy AS runtime
 
 WORKDIR /app
@@ -30,9 +27,6 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 COPY --from=builder /app/dist ./dist
 COPY dashboard/ ./dashboard/
 
-RUN chown -R pwuser:pwuser /app
-USER pwuser
-
 ENV NODE_OPTIONS="--max-old-space-size=400"
 ENV NODE_ENV="production"
 ENV PORT=8080
@@ -42,7 +36,7 @@ EXPOSE 8080
 
 STOPSIGNAL SIGTERM
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
   CMD wget -qO- http://localhost:${PORT}/v1/health || exit 1
 
 CMD ["node", "dist/server.js"]
