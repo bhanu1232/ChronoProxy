@@ -1,48 +1,66 @@
 /**
- * server.ts — Fastify HTTP Server & Route Controller
+ * server.ts — ChronoProxy API Server
+ *
+ * A lightweight, production-grade headless semantic browser proxy.
+ * Streams semantic text tokens from any URL with O(1) memory usage.
  *
  * Endpoints:
- *   GET  /                  — Live monitoring dashboard (static)
- *   POST /v1/browse         — Main proxy: stream semantic tokens for a URL
- *   GET  /v1/health         — Liveness + pool + memory stats (JSON)
- *   GET  /v1/metrics        — Prometheus text format metrics
- *   POST /v1/credentials    — Store encrypted API credential
- *   GET  /v1/credentials    — List registered service names
- *   DEL  /v1/credentials/:service — Remove a credential
- *   WS   /ws/stats          — Real-time pool stats → dashboard
+ *   GET  /              — API index (JSON)
+ *   POST /v1/browse     — Fetch a URL and stream semantic tokens
+ *   GET  /v1/health     — Liveness + pool + memory stats (JSON)
+ *   GET  /v1/metrics    — Prometheus text-format metrics
+ *   POST /v1/credentials/:service — Store an encrypted API key
+ *   GET  /v1/credentials          — List stored service names
+ *   DELETE /v1/credentials/:service — Remove a stored key
  */
 
 import 'dotenv/config';
-import path from 'path';
 import Fastify from 'fastify';
-import fastifyWebsocket from '@fastify/websocket';
 import fastifyCors from '@fastify/cors';
-import fastifyStatic from '@fastify/static';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import { browserPool, PoolStats } from './pool';
+import { browserPool } from './pool';
 import { SemanticPrunerStream } from './pruner';
 import { rateLimitHook, closeRedis } from './ratelimit';
 import { bootstrapSchema, upsertCredential, getCredential, deleteCredential, listServices, closeDb } from './db';
 
-
-// ── Server Initialization ─────────────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────────────────────
 
 const fastify = Fastify({
   logger: false,
-  trustProxy: true,         // X-Forwarded-For support
-  bodyLimit: 1_048_576,     // 1MB max body (URLs are tiny)
+  trustProxy: true,
+  bodyLimit: 1_048_576,     // 1 MB max body
   connectionTimeout: 30_000,
   keepAliveTimeout: 5_000,
 });
 
-// ── Request Telemetry ─────────────────────────────────────────────────────────
+// ── Telemetry counters ────────────────────────────────────────────────────────
 
 let totalRequests = 0;
 let totalErrors   = 0;
 let totalTokens   = 0;
 
-// ── Route: POST /v1/browse ────────────────────────────────────────────────────
+// ── GET / — API index ─────────────────────────────────────────────────────────
+
+fastify.get('/', async (_req, reply) => {
+  const port = process.env['PORT'] ?? '8080';
+  const base = `http://localhost:${port}`;
+  return reply.send({
+    name:    'ChronoProxy',
+    version: '1.0.0',
+    description: 'Headless semantic browser proxy — streams clean text tokens from any URL',
+    endpoints: {
+      browse:          { method: 'POST', path: `${base}/v1/browse`,           body: '{ "url": "https://..." }' },
+      health:          { method: 'GET',  path: `${base}/v1/health`  },
+      metrics:         { method: 'GET',  path: `${base}/v1/metrics` },
+      storeCredential: { method: 'POST', path: `${base}/v1/credentials`,           body: '{ "service": "name", "apiKey": "key" }' },
+      listCredentials: { method: 'GET',  path: `${base}/v1/credentials` },
+      delCredential:   { method: 'DELETE', path: `${base}/v1/credentials/:service` },
+    },
+  });
+});
+
+// ── POST /v1/browse ───────────────────────────────────────────────────────────
 
 fastify.post<{ Body: { url?: string; waitUntil?: string } }>(
   '/v1/browse',
@@ -54,7 +72,6 @@ fastify.post<{ Body: { url?: string; waitUntil?: string } }>(
       return reply.status(400).send({ error: 'Body field "url" is required' });
     }
 
-    // Validate URL shape before spinning up a browser
     let parsedUrl: URL;
     try {
       parsedUrl = new URL(url);
@@ -66,7 +83,7 @@ fastify.post<{ Body: { url?: string; waitUntil?: string } }>(
     }
 
     totalRequests++;
-    let bundle = await browserPool.acquire().catch((err) => {
+    const bundle = await browserPool.acquire().catch((err) => {
       totalErrors++;
       reply.status(503).send({ error: `Browser pool unavailable: ${err.message}` });
       return null;
@@ -82,60 +99,49 @@ fastify.post<{ Body: { url?: string; waitUntil?: string } }>(
 
       await page.goto(parsedUrl.href, {
         waitUntil: validWaitUntil,
-        timeout: parseInt(process.env['BROWSER_TIMEOUT_MS'] ?? '15000', 10),
+        timeout: parseInt(process.env['BROWSER_TIMEOUT_MS'] ?? '30000', 10),
       });
 
       const htmlContent = await page.content();
 
-      // ── Stream Setup ────────────────────────────────────────────────────────
-      // We create a Readable from the HTML string and pipe it through the pruner.
-      // Even though page.content() is a string (not a true network stream), this
-      // ensures the pruner's O(1) chunked model is exercised and the response
-      // is sent incrementally to the client.
-
       reply.raw.writeHead(200, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'X-Proxy-Version': '1.0',
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-store',
+        'Content-Type':     'text/plain; charset=utf-8',
+        'Transfer-Encoding':'chunked',
+        'Cache-Control':    'no-store',
+        'X-Proxy-Version':  '1.0',
       });
 
       const pruner = new SemanticPrunerStream();
 
-      // Feed the HTML string in 64KB chunks (simulates true network streaming)
-      const CHUNK_SIZE = 65_536;
-      const htmlReadable = new Readable({
+      // Feed HTML in 64 KB chunks through the O(1) streaming pruner
+      const CHUNK = 65_536;
+      const source = new Readable({
         read() {
-          let offset = 0;
-          while (offset < htmlContent.length) {
-            this.push(htmlContent.slice(offset, offset + CHUNK_SIZE));
-            offset += CHUNK_SIZE;
+          let off = 0;
+          while (off < htmlContent.length) {
+            this.push(htmlContent.slice(off, off + CHUNK));
+            off += CHUNK;
           }
           this.push(null);
         },
       });
 
-      // pipeline() handles backpressure and cleans up on error automatically
-      await pipeline(htmlReadable, pruner, reply.raw);
+      await pipeline(source, pruner, reply.raw);
 
       const stats = pruner.getStats();
       totalTokens += stats.tokensEmitted;
       console.log(
         `[browse] ${parsedUrl.hostname} | ` +
-        `${stats.bytesIn} bytes → ${stats.tokensEmitted} tokens ` +
-        `(${stats.compressionRatio} of original)`,
+        `${stats.bytesIn} bytes → ${stats.tokensEmitted} tokens (${stats.compressionRatio})`,
       );
 
-      // Return browser to pool (healthy)
       await page.close();
       browserPool.release(bundle);
     } catch (err: any) {
       totalErrors++;
-      console.error(`[browse] Error processing ${parsedUrl.hostname}: ${err.message}`);
+      console.error(`[browse] ${parsedUrl.hostname} error: ${err.message}`);
       await page.close().catch(() => undefined);
-      // Destroy the bundle — Chromium may be in a bad state after a navigation error
       await browserPool.destroy(bundle);
-      // Reply may already be committed (headers sent), so only send if not started
       if (!reply.raw.headersSent) {
         reply.status(500).send({ error: err.message });
       }
@@ -143,61 +149,54 @@ fastify.post<{ Body: { url?: string; waitUntil?: string } }>(
   },
 );
 
-// ── Route: GET /v1/health ─────────────────────────────────────────────────────
+// ── GET /v1/health ────────────────────────────────────────────────────────────
 
 fastify.get('/v1/health', async (_req, reply) => {
-  const poolStats = browserPool.getStats();
-  const memUsage  = process.memoryUsage();
+  const pool = browserPool.getStats();
+  const mem  = process.memoryUsage();
   return reply.send({
     status: 'ok',
-    uptime: Math.floor(process.uptime()),
-    pool: poolStats,
+    uptime:  Math.floor(process.uptime()),
+    pool,
     memory: {
-      rss_mb:      (memUsage.rss          / 1_048_576).toFixed(1),
-      heap_used_mb:(memUsage.heapUsed     / 1_048_576).toFixed(1),
-      heap_total_mb:(memUsage.heapTotal   / 1_048_576).toFixed(1),
-      external_mb: (memUsage.external     / 1_048_576).toFixed(1),
+      rss_mb:        +(mem.rss        / 1_048_576).toFixed(1),
+      heap_used_mb:  +(mem.heapUsed   / 1_048_576).toFixed(1),
+      heap_total_mb: +(mem.heapTotal  / 1_048_576).toFixed(1),
     },
     requests: { total: totalRequests, errors: totalErrors, tokens: totalTokens },
   });
 });
 
-// ── Route: GET /v1/metrics (Prometheus) ───────────────────────────────────────
+// ── GET /v1/metrics (Prometheus) ──────────────────────────────────────────────
 
 fastify.get('/v1/metrics', async (_req, reply) => {
   const ps  = browserPool.getStats();
   const mem = process.memoryUsage();
-  const lines = [
-    '# HELP proxy_browsers_active Active Chromium instances',
-    '# TYPE proxy_browsers_active gauge',
+  const out = [
+    `# HELP proxy_browsers_active Active Chromium instances`,
+    `# TYPE proxy_browsers_active gauge`,
     `proxy_browsers_active ${ps.active}`,
-    '# HELP proxy_browsers_idle Idle Chromium instances in pool',
-    '# TYPE proxy_browsers_idle gauge',
+    `# HELP proxy_browsers_idle Idle Chromium instances`,
+    `# TYPE proxy_browsers_idle gauge`,
     `proxy_browsers_idle ${ps.idle}`,
-    '# HELP proxy_requests_queued Requests waiting for a browser slot',
-    '# TYPE proxy_requests_queued gauge',
-    `proxy_requests_queued ${ps.queued}`,
-    '# HELP proxy_estimated_memory_mb Estimated total RAM usage MB',
-    '# TYPE proxy_estimated_memory_mb gauge',
-    `proxy_estimated_memory_mb ${ps.estimatedMemoryMB}`,
-    '# HELP proxy_requests_total Total HTTP requests processed',
-    '# TYPE proxy_requests_total counter',
+    `# HELP proxy_requests_total Total requests`,
+    `# TYPE proxy_requests_total counter`,
     `proxy_requests_total ${totalRequests}`,
-    '# HELP proxy_errors_total Total errors',
-    '# TYPE proxy_errors_total counter',
+    `# HELP proxy_errors_total Total errors`,
+    `# TYPE proxy_errors_total counter`,
     `proxy_errors_total ${totalErrors}`,
-    '# HELP proxy_tokens_total Total semantic tokens emitted',
-    '# TYPE proxy_tokens_total counter',
+    `# HELP proxy_tokens_total Semantic tokens emitted`,
+    `# TYPE proxy_tokens_total counter`,
     `proxy_tokens_total ${totalTokens}`,
-    '# HELP process_heap_used_bytes Node.js heap used',
-    '# TYPE process_heap_used_bytes gauge',
+    `# HELP process_heap_used_bytes Node.js heap`,
+    `# TYPE process_heap_used_bytes gauge`,
     `process_heap_used_bytes ${mem.heapUsed}`,
-  ];
+  ].join('\n') + '\n';
   reply.header('Content-Type', 'text/plain; version=0.0.4');
-  return reply.send(lines.join('\n') + '\n');
+  return reply.send(out);
 });
 
-// ── Route: Credential Vault ───────────────────────────────────────────────────
+// ── Credential Vault ──────────────────────────────────────────────────────────
 
 fastify.post<{ Body: { service?: string; apiKey?: string } }>(
   '/v1/credentials',
@@ -217,8 +216,7 @@ fastify.post<{ Body: { service?: string; apiKey?: string } }>(
 
 fastify.get('/v1/credentials', async (_req, reply) => {
   try {
-    const services = await listServices();
-    return reply.send({ services });
+    return reply.send({ services: await listServices() });
   } catch (e: any) {
     return reply.status(500).send({ error: e.message });
   }
@@ -241,110 +239,67 @@ fastify.delete<{ Params: { service: string } }>(
   '/v1/credentials/:service',
   async (request, reply) => {
     try {
-      const deleted = await deleteCredential(request.params.service);
-      return reply.send({ deleted });
+      return reply.send({ deleted: await deleteCredential(request.params.service) });
     } catch (e: any) {
       return reply.status(500).send({ error: e.message });
     }
   },
 );
 
-// ── Route: WebSocket /ws/stats ────────────────────────────────────────────────
-
-fastify.get('/ws/stats', { websocket: true }, (socket) => {
-  // @fastify/websocket v3 exposes the raw `ws` instance as socket.socket.
-  // socket itself is the Duplex stream — readyState / send live one level down.
-  const ws = (socket as any).socket ?? socket;
-
-  const sendStats = (stats: PoolStats) => {
-    try {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({
-          ...stats,
-          nodeMemMB: (process.memoryUsage().rss / 1_048_576).toFixed(1),
-          uptime:    Math.floor(process.uptime()),
-          totalRequests,
-          totalErrors,
-          totalTokens,
-          ts: Date.now(),
-        }));
-      }
-    } catch {
-      // Client disconnected mid-send — remove listener silently
-      browserPool.off('stats', sendStats);
-    }
-  };
-
-  browserPool.on('stats', sendStats);
-  sendStats(browserPool.getStats()); // immediate snapshot on connect
-
-  ws.on('close', () => browserPool.off('stats', sendStats));
-  ws.on('error', () => browserPool.off('stats', sendStats));
-});
-
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 async function start(): Promise<void> {
-  // ── Plugin registration (order matters) ────────────────────────────────────
-
-  // CORS — allow browser requests from any origin (needed for dashboard)
   await fastify.register(fastifyCors, {
-    origin: true,               // reflect the request origin
+    origin: true,
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
   });
 
-  // Static files — serve the dashboard/ folder at GET /
-  const dashboardDir = path.join(process.cwd(), 'dashboard');
-  await fastify.register(fastifyStatic, {
-    root:   dashboardDir,
-    prefix: '/',
-    decorateReply: true,
-  });
+  await bootstrapSchema().catch((e) =>
+    console.warn('[startup] DB schema skipped (no Postgres):', e.message),
+  );
 
-  // WebSocket support
-  await fastify.register(fastifyWebsocket);
+  browserPool.startStatsEmitter(5000);  // internal only — no WS clients
 
-  // ── Startup tasks ──────────────────────────────────────────────────────────
-  await bootstrapSchema().catch((e) => {
-    console.warn('[startup] DB schema bootstrap skipped:', e.message);
-  });
-
-  browserPool.startStatsEmitter(1000);
-
-  const port = parseInt(process.env['PORT'] ?? '3001', 10);
+  const port = parseInt(process.env['PORT'] ?? '8080', 10);
   const host = process.env['HOST'] ?? '0.0.0.0';
 
-  const poolStats = browserPool.getStats();
   await fastify.listen({ port, host });
-  console.log(`\n🚀 Semantic Browser Proxy  →  http://${host}:${port}`);
-  console.log(`   📊 Dashboard             →  http://${host}:${port}/`);
-  console.log(`   ❤️  Health               →  http://${host}:${port}/v1/health`);
-  console.log(`   📈 Metrics (Prometheus)  →  http://${host}:${port}/v1/metrics`);
-  console.log(`   🔌 WS stats feed         →  ws://${host}:${port}/ws/stats`);
-  console.log(`   🔒 Pool ceiling          →  ${poolStats.maxBrowsers} browsers · 512 MB\n`);
+
+  const ps = browserPool.getStats();
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║  ChronoProxy  ready on http://${host}:${port}
+╠══════════════════════════════════════════════════╣
+║  POST /v1/browse          ← main endpoint
+║  GET  /v1/health          ← liveness probe
+║  GET  /v1/metrics         ← prometheus
+║  POST /v1/credentials     ← store API keys
+╠══════════════════════════════════════════════════╣
+║  Pool : ${ps.maxBrowsers} browsers · RAM ceiling ~512 MB
+╚══════════════════════════════════════════════════╝
+`);
 }
 
 // ── Graceful Shutdown ─────────────────────────────────────────────────────────
 
 async function shutdown(signal: string): Promise<void> {
-  console.log(`\n[shutdown] Received ${signal}. Draining pool and closing connections...`);
+  console.log(`\n[shutdown] ${signal} — draining pool...`);
   await fastify.close();
   await browserPool.drain();
   await closeRedis();
   await closeDb();
-  console.log('[shutdown] Clean exit.');
+  console.log('[shutdown] clean exit');
   process.exit(0);
 }
 
 process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.on('SIGINT',  () => { void shutdown('SIGINT'); });
 process.on('uncaughtException', (err) => {
-  console.error('[error] Uncaught exception (recovered):', err);
+  console.error('[error] uncaught exception:', err.message);
 });
 
 start().catch((err) => {
-  console.error('[fatal] Startup failed:', err);
+  console.error('[fatal] startup failed:', err);
   process.exit(1);
 });

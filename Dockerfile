@@ -51,7 +51,6 @@ RUN npx playwright install --with-deps chromium
 
 # ── Application code ──────────────────────────────────────────────────────────
 COPY --from=builder /app/dist ./dist
-COPY dashboard/ ./dashboard/
 
 # ── Runtime environment ───────────────────────────────────────────────────────
 ENV NODE_ENV=production
