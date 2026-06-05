@@ -6,7 +6,7 @@ on:
   workflow_dispatch:        # allow manual trigger from GitHub Actions tab
 
 env:
-  IMAGE_NAME: bhanu1232/chronoproxy
+  IMAGE_NAME: bhanuchowdam/chronoproxy
 
 jobs:
   build-and-push:
