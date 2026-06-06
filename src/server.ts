@@ -36,7 +36,7 @@ import { browserPool } from './pool';
 import { SemanticPrunerStream } from './pruner';
 import { rateLimitHook, closeRedis } from './ratelimit';
 import { extractPageState } from './extractor';
-import { executeActions, Action } from './actions';
+import { executeActions, executeActionsStreaming, Action } from './actions';
 import { sessionManager } from './session';
 import {
   bootstrapSchema, upsertCredential, getCredential,
@@ -73,8 +73,9 @@ fastify.get('/', async (_req, reply) => {
       // Sessions
       createSession:   'POST /v1/session          { url }           → { sessionId, state }',
       getSession:      'GET  /v1/session/:id                        → { state }',
-      runActions:      'POST /v1/session/:id/action { actions: [] } → { results, state }',
-      closeSession:    'DELETE /v1/session/:id                      → { ok }',
+      runActions:      'POST /v1/session/:id/action        { actions: [] } → { results, state }',
+      runActionsStream:'POST /v1/session/:id/action/stream { actions: [] } → SSE stream of ActionResult events',
+      closeSession:    'DELETE /v1/session/:id                             → { ok }',
       // Observability
       health:          'GET  /v1/health',
       metrics:         'GET  /v1/metrics',
@@ -313,6 +314,100 @@ fastify.post<{
   },
 );
 
+// ── POST /v1/session/:id/action/stream — SSE real-time action telemetry ─────────
+//
+// Same semantics as /action but streams one Server-Sent Event per step:
+//
+//   event: action_result
+//   data: {"step":1,"total":4,"type":"fill","ok":true,"durationMs":82}
+//
+//   event: action_result
+//   data: {"step":2,"total":4,"type":"click","ok":false,"durationMs":15012,"error":"Timeout"}
+//
+//   event: done
+//   data: {"completedSteps":2,"success":false,"state":{...}}
+//
+// The agent can process each step result immediately without waiting for
+// the entire batch — enabling real-time retry and adaptive strategy.
+
+fastify.post<{
+  Params: { id: string };
+  Body:   { actions?: Action[] };
+}>(
+  '/v1/session/:id/action/stream',
+  { preHandler: rateLimitHook },
+  async (request, reply) => {
+    const { actions } = request.body ?? {};
+
+    if (!Array.isArray(actions) || actions.length === 0) {
+      return reply.status(400).send({ error: 'Body field "actions" must be a non-empty array' });
+    }
+    if (actions.length > 50) {
+      return reply.status(400).send({ error: 'Max 50 actions per request' });
+    }
+
+    let session;
+    try {
+      session = sessionManager.get(request.params.id);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err.message });
+    }
+
+    // ── Set SSE headers ──────────────────────────────────────────────────────
+    // We write headers manually so we can keep the connection open and stream
+    // individual events as each action completes.
+    reply.raw.writeHead(200, {
+      'Content-Type':  'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection':    'keep-alive',
+      'X-Accel-Buffering': 'no',           // Disable Nginx/proxy buffering
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    // Helper to write a single SSE event
+    const sendEvent = (event: string, data: unknown): void => {
+      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    totalRequests++;
+    const results: Array<{ step: number; total: number; type: string; ok: boolean; durationMs: number; error?: string }> = [];
+    let completedSteps = 0;
+    let overallSuccess = true;
+
+    try {
+      for await (const result of executeActionsStreaming(session.page, actions)) {
+        results.push(result);
+        completedSteps = result.step;
+        if (!result.ok) overallSuccess = false;
+
+        // Push this step's result to the client immediately
+        sendEvent('action_result', result);
+
+        // If a step failed, the generator has already stopped — break is implicit
+      }
+
+      // Extract updated page state after all actions
+      const state = await extractPageState(session.page);
+      sessionManager.touch(session.id);
+
+      const logSuffix = overallSuccess
+        ? `${completedSteps} actions OK`
+        : `FAILED at step ${completedSteps}: ${results.find(r => !r.ok)?.error ?? 'unknown'}`;
+      console.log(`[session:action:stream] ${session.id} | ${logSuffix}`);
+
+      // Final event: summary + new page state
+      sendEvent('done', { completedSteps, totalSteps: actions.length, success: overallSuccess, state });
+    } catch (err: any) {
+      totalErrors++;
+      console.error(`[session:action:stream] ${session.id} error: ${err.message}`);
+      sendEvent('error', { message: err.message });
+    } finally {
+      reply.raw.end();
+    }
+    return reply;
+  },
+);
+
 // ── DELETE /v1/session/:id — close session ────────────────────────────────────
 
 fastify.delete<{ Params: { id: string } }>(
@@ -440,8 +535,9 @@ async function start(): Promise<void> {
 ║  SESSIONS  (AI agent workflow)                             ║
 ║    POST   /v1/session        create + navigate             ║
 ║    GET    /v1/session/:id    read current page             ║
-║    POST   /v1/session/:id/action  click/type/scroll/…      ║
-║    DELETE /v1/session/:id    close session                 ║
+║    POST   /v1/session/:id/action        sync batch          ║
+║    POST   /v1/session/:id/action/stream SSE real-time       ║
+║    DELETE /v1/session/:id               close session       ║
 ║                                                            ║
 ║  OBSERVABILITY                                             ║
 ║    GET /v1/health  ·  GET /v1/metrics                      ║

@@ -80,6 +80,48 @@ export async function executeActions(page: Page, actions: Action[]): Promise<Act
   return results;
 }
 
+/**
+ * executeActionsStreaming
+ *
+ * Async generator variant of executeActions. Yields one ActionResult
+ * immediately after each action completes — success or failure.
+ *
+ * This lets the SSE endpoint push real-time progress to the AI agent
+ * without buffering the entire batch. The agent can react to step 4's
+ * failure while steps 5-10 have not yet been attempted.
+ *
+ * Usage:
+ *   for await (const result of executeActionsStreaming(page, actions)) {
+ *     sendSSE(result);
+ *   }
+ */
+export async function* executeActionsStreaming(
+  page: Page,
+  actions: Action[],
+): AsyncGenerator<ActionResult & { step: number; total: number }> {
+  const total = actions.length;
+
+  for (let i = 0; i < actions.length; i++) {
+    const action = actions[i]!;
+    const t0  = Date.now();
+    let ok    = true;
+    let error: string | undefined;
+
+    try {
+      await runAction(page, action);
+    } catch (err: any) {
+      ok    = false;
+      error = err.message ?? String(err);
+      // Yield the failure immediately so the client gets it right away
+      yield { step: i + 1, total, type: action.type, ok, durationMs: Date.now() - t0, error };
+      // Stop on first failure — same semantics as executeActions
+      return;
+    }
+
+    yield { step: i + 1, total, type: action.type, ok, durationMs: Date.now() - t0 };
+  }
+}
+
 // ── Internal dispatcher ───────────────────────────────────────────────────────
 
 async function runAction(page: Page, action: Action): Promise<void> {
