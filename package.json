@@ -7,7 +7,6 @@
     "build": "tsc",
     "dev": "ts-node src/server.ts",
     "start": "node dist/server.js",
-    "dashboard": "npx http-server dashboard -p 3000 --cors",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
